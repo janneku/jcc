@@ -3,21 +3,18 @@ void printf(..);
 int main() {
 	int cols = 8;
 	int rows = 20;
+	int i;
 
-	int i = 1;
-	while (i < cols) {
+	for (i = 0; i < cols; i = i + 1) {
 		printf("%d\t", i);
-		i = i + 1;
 	}
 	printf("\n");
-	i = 1;
-	while (i < rows) {
-		int j = 1;
-		while (j < cols) {
+	for (i = 0; i < rows; i = i + 1) {
+		int j;
+		printf("%d\t", i);
+		for (j = 0; j < cols; j = j + 1) {
 			printf("%d\t", i*j);
-			j = j + 1;
 		}
 		printf("\n");
-		i = i + 1;
 	}
 }

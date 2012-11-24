@@ -15,6 +15,7 @@ enum {
 	/* 0..255 are single character tokens */
 	TOK_WHILE = 1000,
 	TOK_IF,
+	TOK_FOR,
 	TOK_RETURN,
 	TOK_CHAR,
 	TOK_INT,
@@ -157,6 +158,8 @@ void lex()
 			token = TOK_WHILE;
 		else if (strcmp(buf, "if") == 0)
 			token = TOK_IF;
+		else if (strcmp(buf, "for") == 0)
+			token = TOK_FOR;
 		else if (strcmp(buf, "return") == 0)
 			token = TOK_RETURN;
 		else if (strcmp(buf, "char") == 0)
@@ -609,8 +612,7 @@ void if_statement()
 	/* Compare the condition against zero */
 	int skip_label = next_label++;
 	load(condition, -1);
-	printf("\tor %s, %s\n", reg(condition),
-		reg(condition));
+	printf("\tor %s, %s\n", reg(condition), reg(condition));
 	printf("\tjz l%d\n", skip_label);
 	drop(condition);
 	free(condition);
@@ -624,8 +626,8 @@ void while_statement()
 {
 	expect('(');
 
-	int begin_label = next_label++;
-	printf("l%d:\n", begin_label);
+	int test_label = next_label++;
+	printf("l%d:\n", test_label);
 
 	struct value *condition = expr();
 	expect(')');
@@ -633,8 +635,7 @@ void while_statement()
 	/* Compare the condition against zero */
 	int end_label = next_label++;
 	load(condition, -1);
-	printf("\tor %s, %s\n", reg(condition),
-		reg(condition));
+	printf("\tor %s, %s\n", reg(condition), reg(condition));
 	printf("\tjz l%d\n", end_label);
 	drop(condition);
 	free(condition);
@@ -642,7 +643,54 @@ void while_statement()
 	block();
 
 	/* Jump back to test the condition again */
+	printf("\tjmp l%d\n", test_label);
+	printf("l%d:\n", end_label);
+}
+
+void for_statement()
+{
+	expect('(');
+
+	struct value *initial = expr();
+	expect(';');
+	drop(initial);
+	free(initial);
+
+	int test_label = next_label++;
+	printf("l%d:\n", test_label);
+
+	struct value *condition = expr();
+	expect(';');
+
+	/* Compare the condition against zero */
+	int end_label = next_label++;
+	load(condition, -1);
+	printf("\tor %s, %s\n", reg(condition), reg(condition));
+	printf("\tjz l%d\n", end_label);
+	drop(condition);
+	free(condition);
+
+	/* Skip over the step which follows */
+	int begin_label = next_label++;
 	printf("\tjmp l%d\n", begin_label);
+
+	int step_label = next_label++;
+	printf("l%d:\n", step_label);
+
+	struct value *step = expr();
+	expect(')');
+	drop(step);
+	free(step);
+
+	/* Jump back to test the condition */
+	printf("\tjmp l%d\n", test_label);
+
+	printf("l%d:\n", begin_label);
+
+	block();
+
+	/* Jump back to step after which test the condition */
+	printf("\tjmp l%d\n", step_label);
 	printf("l%d:\n", end_label);
 }
 
@@ -672,6 +720,10 @@ void statement()
 	case TOK_WHILE:
 		lex();
 		while_statement();
+		break;
+	case TOK_FOR:
+		lex();
+		for_statement();
 		break;
 	case TOK_RETURN:
 		lex();
