@@ -35,14 +35,6 @@ enum {
 	TYPE_INT,
 };
 
-/* Storages */
-enum {
-	STOR_CONSTANT,
-	STOR_REGISTER,
-	STOR_GLOBAL,
-	STOR_STACK,
-};
-
 /*
  * must match reg_names[]. The first ones are preferred over the latter.
  * Note, these are the same as in x86-64 call convention, but reversed.
@@ -62,13 +54,12 @@ const char *reg_byte_names[] = {"%al", "%bl", "%cl", "%dl", "%sil", "%dil"};
 
 struct value {
 	struct value *next;
-	char *ident;
+	char *ident; /* identifier (also global name) */
 	int type;
+	int constant;
 	int return_type; /* Return type for functions */
-	int storage;
-	int locked; /* Is locked to the register? */
 	unsigned long value; /* constant value */
-	size_t loc; /* register number or stack position */
+	size_t stack_pos;
 	int varargs; /* Function uses variable arguments */
 	struct value *args; /* function != 0 */
 };
@@ -88,19 +79,45 @@ size_t stack_size;
 unsigned long token_value;
 char *token_str = NULL;
 struct value *registers[MAX_REG] = {};
+int reg_locked[MAX_REG] = {};
 int return_stmt;
 
-/* Returns the register where a value is stored */
-const char *reg(const struct value *val)
+/* Search for the register where the value is stored */
+int search_reg(const struct value *val)
 {
-	assert(val->storage == STOR_REGISTER);
-	return reg_names[val->loc];
+	int i;
+	for (i = 0; i < MAX_REG; ++i) {
+		if (registers[i] == val)
+			return i;
+	}
+	return -1;
 }
 
-const char *bytereg(const struct value *val)
+/* Called when a value is no longer needed. */
+void drop(const struct value *val)
 {
-	assert(val->storage == STOR_REGISTER);
-	return reg_byte_names[val->loc];
+	if (val->stack_pos > 0 || val->ident != NULL)
+		return;
+	int i;
+	for (i = 0; i < MAX_REG; ++i) {
+		if (registers[i] == val)
+			registers[i] = NULL;
+	}
+}
+
+int copies(const struct value *val)
+{
+	if (val->constant || val->ident != NULL)
+		return 999;
+	int count = 0;
+	if (val->stack_pos > 0)
+		count++;
+	int i;
+	for (i = 0; i < MAX_REG; ++i) {
+		if (registers[i] == val)
+			count++;
+	}
+	return count;
 }
 
 /* Parse an alphanumeric string (e.g. identifiers and reserved words) */
@@ -234,26 +251,15 @@ struct value *lookup(const char *ident)
 }
 
 /* Moves a value from a register to stack. Used to solve register pressue. */
-void push(struct value *val)
+void push(int reg)
 {
-	if (val->storage == STOR_REGISTER) {
-		assert(!val->locked);
-		assert(registers[val->loc] == val);
-		printf("\tpush %s\n", reg(val));
-		registers[val->loc] = NULL;
+	struct value *val = registers[reg];
+	if (copies(val) == 1) {
+		printf("\tpush %s\n", reg_names[reg]);
 		stack_size += 8;
-		val->loc = stack_size;
-		val->storage = STOR_STACK;
+		val->stack_pos = stack_size;
 	}
-}
-
-/* Called when a value is no longer used */
-void drop(struct value *val)
-{
-	if (val->storage == STOR_REGISTER) {
-		assert(registers[val->loc] == val);
-		registers[val->loc] = NULL;
-	}
+	registers[reg] = NULL;
 }
 
 /* Allocates an unused register. */
@@ -266,59 +272,72 @@ size_t alloc_register()
 	}
 	/* Try to spill to stack */
 	for (i = MAX_REG - 1; i >= 0; --i) {
-		if (!registers[i]->locked) {
-			push(registers[i]);
+		if (!reg_locked[i]) {
+			push(i);
 			return i;
 		}
 	}
 	error("unable to allocate a register\n");
 }
 
+/* Returns operand for printing. */
+const char *asm_operand(const struct value *val)
+{
+	static char buf[64];
+
+	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION)
+		error("non-numeric type for expression\n");
+
+	/* First, see if we have it in a register */
+	int reg = search_reg(val);
+	if (reg >= 0)
+		return reg_names[reg];
+
+	/* Second, try use a constant value */
+	if (val->constant) {
+		sprintf(buf, "$%lu", val->value);
+		return buf;
+	}
+
+	/* Finally, load from memory */
+	if (val->stack_pos > 0) {
+		sprintf(buf, "%zu(%%rsp)", stack_size - val->stack_pos);
+		return buf;
+	}
+
+	/* If it does not have stack position, it's a global */
+	assert(val->ident != NULL);
+	return val->ident;
+}
+
 /* Loads a value into the given register. -1 means any register */
-void load(struct value *val, int loc)
+int load(struct value *val, int reg)
 {
 	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION)
 		error("non-numeric type for expression\n");
 
-	if (loc < 0) {
-		if (val->storage == STOR_REGISTER) {
-			val->locked = 1;
-			return;
+	if (reg < 0) {
+		reg = search_reg(val);
+		if (reg >= 0) {
+			reg_locked[reg] = 1;
+			return reg;
 		}
-		loc = alloc_register();
+		reg = alloc_register();
 	}
-	if (val->storage == STOR_REGISTER && val->loc == (size_t) loc) {
-		val->locked = 1;
-		return;
-	}
-	if (registers[loc] != NULL) {
-		/* Register is already occupied */
-		push(registers[loc]);
+	if (registers[reg] == val) {
+		reg_locked[reg] = 1;
+		return reg;
 	}
 
-	switch (val->storage) {
-	case STOR_CONSTANT:
-		printf("\tmov $%zu, %s\n", val->value, reg_names[loc]);
-		break;
-	case STOR_REGISTER:
-		assert(registers[val->loc] == val);
-		registers[val->loc] = NULL;
-		printf("\tmov %s, %s\n", reg(val), reg_names[loc]);
-		break;
-	case STOR_GLOBAL:
-		printf("\tmov %s, %s\n", val->ident, reg_names[loc]);
-		break;
-	case STOR_STACK:
-		printf("\tmov %zu(%%rsp), %s\n", stack_size - val->loc,
-			reg_names[loc]);
-		break;
-	default:
-		assert(0);
+	if (registers[reg] != NULL) {
+		/* Register is already occupied */
+		push(reg);
 	}
-	registers[loc] = val;
-	val->storage = STOR_REGISTER;
-	val->loc = loc;
-	val->locked = 1;
+
+	printf("\tmov %s, %s\n", asm_operand(val), reg_names[reg]);
+	registers[reg] = val;
+	reg_locked[reg] = 1;
+	return reg;
 }
 
 /* Parses a C declaration, which are used for variables and types */
@@ -384,18 +403,14 @@ void function_call(struct value *fun)
 	if (fun->type != TYPE_FUNCTION)
 		error("calling a non-function: %s\n", fun->ident);
 
-	struct value *values = NULL;
-	struct value *last_val = NULL;
+	struct value *values[MAX_REG] = {};
 	struct value *arg = fun->args;
+	int i = 0;
 	while (!check(')')) {
 		if (arg == NULL && !fun->varargs)
 			error("too many arguments for %s\n", fun->ident);
 		struct value *val = expr();
-		if (last_val == NULL)
-			values = val;
-		else
-			last_val->next = val;
-		last_val = val;
+		values[i++] = val;
 		if (token != ')') {
 			expect(',');
 		}
@@ -404,18 +419,13 @@ void function_call(struct value *fun)
 	}
 
 	/* Then, arrange the values for x86-64 call convention */
-	int loc = RDI;
-	for (arg = values; arg != NULL; arg = arg->next) {
-		load(arg, loc);
-		loc--;
-	}
-	/* Reserve all other registers, as callee might modify them */
-	while (1) {
-		if (registers[loc] != NULL)
-			push(registers[loc]);
-		if (loc == RAX)
-			break;
-		loc--;
+	for (i = 0; i < MAX_REG; ++i) {
+		if (values[i] != NULL) {
+			load(values[i], RDI - i);
+		} else if (registers[RDI - i] != NULL) {
+			/* Reserve all other registers */
+			push(RDI - i);
+		}
 	}
 
 	/* The stack must be aligned to 16 after call */
@@ -426,11 +436,9 @@ void function_call(struct value *fun)
 	}
 
 	printf("\tcall %s\n", fun->ident);
-	while (values != NULL) {
-		arg = values;
-		values = arg->next;
-		drop(arg);
-		free(arg);
+	for (i = 0; i < MAX_REG; ++i) {
+		if (values[i] != NULL)
+			drop(values[i]);
 	}
 }
 
@@ -449,41 +457,44 @@ struct value *term()
 		}
 		break;
 
-	case '-':
-		lex();
-		result = term();
-		load(result, -1);
-		printf("\tneg %s\n", reg(result));
-		result->locked = 0;
-		break;
-
-	case TOK_IDENTIFIER: {
-			struct value *val = lookup(token_str);
-			if (val == NULL)
-				error("undefined: %s\n", token_str);
+	case '-': {
 			lex();
+			struct value *val = term();
+			int reg = load(val, -1);
+			printf("\tneg %s\n", reg_names[reg]);
+			reg_locked[reg] = 0;
+			drop(val);
+
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
-			*result = *val;
-			result->next = NULL; /* just to be safe.. */
-			if (check('(')) {
-				function_call(val);
-				result->type = val->return_type;
-				if (result->type != TYPE_VOID) {
-					result->loc = RAX;
-					result->storage = STOR_REGISTER;
-					registers[RAX] = result;
-				}
-			}
+			result->type = val->type;
+			registers[reg] = result;
 			break;
 		}
+
+	case TOK_IDENTIFIER:
+		result = lookup(token_str);
+		if (result == NULL)
+			error("undefined: %s\n", token_str);
+		lex();
+		if (check('(')) {
+			struct value *fun = result;
+			function_call(fun);
+			result = calloc(1, sizeof(*result));
+			assert(result != NULL);
+			result->type = fun->return_type;
+			if (result->type != TYPE_VOID) {
+				registers[RAX] = result;
+			}
+		}
+		break;
 
 	case TOK_NUMBER: {
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = TYPE_INT;
 			result->value = token_value;
-			result->storage = STOR_CONSTANT;
+			result->constant = 1;
 			lex();
 			break;
 		}
@@ -503,10 +514,9 @@ struct value *term()
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = TYPE_POINTER;
-			result->loc = alloc_register();
-			result->storage = STOR_REGISTER;
-			registers[result->loc] = result;
-			printf("\tmov $l%d, %s\n", s->label, reg(result));
+			int reg = alloc_register();
+			printf("\tmov $l%d, %s\n", s->label, reg_names[reg]);
+			registers[reg] = result;
 			break;
 		}
 
@@ -532,35 +542,37 @@ struct value *binop_expr()
 		struct value *lhs = result;
 		struct value *rhs = term();
 
-		load(lhs, -1);
-		load(rhs, -1);
+		int reg = load(lhs, -1);
 		switch (oper) {
 		case '+':
-			printf("\tadd %s, %s\n", reg(rhs), reg(lhs));
+			printf("\tadd %s, %s\n", asm_operand(rhs), reg_names[reg]);
 			break;
 		case '-':
-			printf("\tsub %s, %s\n", reg(rhs), reg(lhs));
+			printf("\tsub %s, %s\n", asm_operand(rhs), reg_names[reg]);
 			break;
 		case '*':
-			printf("\timul %s, %s\n", reg(rhs), reg(lhs));
+			printf("\timul %s, %s\n", asm_operand(rhs), reg_names[reg]);
 			break;
 		case '<':
-			printf("\tcmp %s, %s\n", reg(rhs), reg(lhs));
-			printf("\tsetl %s\n", bytereg(result));
-			printf("\tmovzx %s, %s\n", bytereg(result), reg(result));
+			printf("\tcmp %s, %s\n", asm_operand(rhs), reg_names[reg]);
+			printf("\tsetl %s\n", reg_byte_names[reg]);
+			printf("\tmovzx %s, %s\n", reg_byte_names[reg], reg_names[reg]);
 			break;
 		case '>':
-			printf("\tcmp %s, %s\n", reg(rhs), reg(lhs));
-			printf("\tsetg %s\n", bytereg(result));
-			printf("\tmovzx %s, %s\n", bytereg(result), reg(result));
+			printf("\tcmp %s, %s\n", asm_operand(rhs), reg_names[reg]);
+			printf("\tsetg %s\n", reg_byte_names[reg]);
+			printf("\tmovzx %s, %s\n", reg_byte_names[reg], reg_names[reg]);
 			break;
 		default:
 			assert(0);
 		}
-		result = lhs;
-		result->locked = 0;
+		reg_locked[reg] = 0;
+		drop(lhs);
 		drop(rhs);
-		free(rhs);
+		result = calloc(1, sizeof(*result));
+		assert(result != NULL);
+		result->type = lhs->type;
+		registers[reg] = result;
 	}
 	return result;
 }
@@ -574,30 +586,36 @@ struct value *expr()
 
 		struct value *target = result;
 
-		if (target->storage == STOR_REGISTER)
-			error("invalid assignment target\n");
-
 		struct value *val = expr();
 
-		load(val, -1);
-		switch (target->storage) {
-		case STOR_GLOBAL:
-			printf("\tmov %s, %s\n", reg(val), target->ident);
-			break;
-		case STOR_STACK:
-			printf("\tmov %s, %zu(%%rsp)\n", reg(val),
-				stack_size - target->loc);
-			break;
-		default:
-			assert(0);
-		}
+		int reg = load(val, -1);
+		printf("\tmov %s, %s\n", reg_names[reg], asm_operand(target));
+		reg_locked[reg] = 0;
+
 		/* The value is passed through */
-		drop(target);
-		free(target);
 		result = val;
-		result->locked = 0;
 	}
 	return result;
+}
+
+void end_block(size_t old_stack)
+{
+	/* Clean up allocated stack space */
+	if (stack_size > old_stack) {
+		printf("\tadd $%zu, %%rsp\n", stack_size - old_stack);
+		stack_size = old_stack;
+	}
+
+	/* remove unreachable stack positions */
+	struct value *val = symtab;
+	while (val != NULL) {
+		if (val->stack_pos > stack_size)
+			val->stack_pos = 0;
+		val = val->next;
+	}
+
+	/* Reset registers */
+	memset(registers, 0, sizeof registers);
 }
 
 void block();
@@ -606,16 +624,19 @@ void if_statement()
 {
 	expect('(');
 
+	size_t old_stack = stack_size;
+
 	struct value *condition = expr();
 	expect(')');
 
 	/* Compare the condition against zero */
 	int skip_label = next_label++;
-	load(condition, -1);
-	printf("\tor %s, %s\n", reg(condition), reg(condition));
+	int reg = load(condition, -1);
+	printf("\tor %s, %s\n", reg_names[reg], reg_names[reg]);
 	printf("\tjz l%d\n", skip_label);
 	drop(condition);
-	free(condition);
+
+	end_block(old_stack);
 
 	block();
 
@@ -629,16 +650,19 @@ void while_statement()
 	int test_label = next_label++;
 	printf("l%d:\n", test_label);
 
+	size_t old_stack = stack_size;
+
 	struct value *condition = expr();
 	expect(')');
 
 	/* Compare the condition against zero */
 	int end_label = next_label++;
-	load(condition, -1);
-	printf("\tor %s, %s\n", reg(condition), reg(condition));
+	int reg = load(condition, -1);
+	printf("\tor %s, %s\n", reg_names[reg], reg_names[reg]);
 	printf("\tjz l%d\n", end_label);
 	drop(condition);
-	free(condition);
+
+	end_block(old_stack);
 
 	block();
 
@@ -651,39 +675,48 @@ void for_statement()
 {
 	expect('(');
 
+	size_t old_stack = stack_size;
+
 	struct value *initial = expr();
-	expect(';');
 	drop(initial);
-	free(initial);
+	expect(';');
+
+	end_block(old_stack);
 
 	int test_label = next_label++;
 	printf("l%d:\n", test_label);
+
+	old_stack = stack_size;
 
 	struct value *condition = expr();
 	expect(';');
 
 	/* Compare the condition against zero */
 	int end_label = next_label++;
-	load(condition, -1);
-	printf("\tor %s, %s\n", reg(condition), reg(condition));
+	int reg = load(condition, -1);
+	printf("\tor %s, %s\n", reg_names[reg], reg_names[reg]);
 	printf("\tjz l%d\n", end_label);
 	drop(condition);
-	free(condition);
 
 	/* Skip over the step which follows */
 	int begin_label = next_label++;
 	printf("\tjmp l%d\n", begin_label);
 
+	end_block(old_stack);
+
 	int step_label = next_label++;
 	printf("l%d:\n", step_label);
 
+	old_stack = stack_size;
+
 	struct value *step = expr();
-	expect(')');
 	drop(step);
-	free(step);
+	expect(')');
 
 	/* Jump back to test the condition */
 	printf("\tjmp l%d\n", test_label);
+
+	end_block(old_stack);
 
 	printf("l%d:\n", begin_label);
 
@@ -706,8 +739,6 @@ void return_statement()
 		printf("\tadd $%zu, %%rsp\n", stack_size - 8);
 	printf("\tpop %%rbx\n");
 	printf("\tret\n");
-	drop(val);
-	free(val);
 }
 
 void statement()
@@ -734,29 +765,24 @@ void statement()
 			if (var != NULL) {
 				/* It's a variable declaration */
 				stack_size += 8;
-				var->loc = stack_size;
-				var->storage = STOR_STACK;
+				var->stack_pos = stack_size;
 				var->next = symtab;
 				symtab = var;
 				printf("\tsub $8, %%rsp\n");
 
 				if (check('=')) {
 					/* Initialization */
-					struct value *val = expr();
-					load(val, -1);
+					struct value *init = expr();
+					int reg = load(init, -1);
 					printf("\tmov %s, %zu(%%rsp)\n",
-						reg(val),
-						stack_size - var->loc);
-					free(val);
-					drop(val);
+						reg_names[reg],
+						stack_size - var->stack_pos);
+					drop(init);
 				}
 			} else {
 				/* It's an expression. Throw the result away */
 				struct value *result = expr();
-				if (result->type != TYPE_VOID) {
-					drop(result);
-					free(result);
-				}
+				drop(result);
 			}
 			expect(';');
 			break;
@@ -788,12 +814,7 @@ void block()
 		statement();
 
 	close_scope(old_sym);
-
-	/* Clean up allocated stack space */
-	if (stack_size > old_stack) {
-		printf("\tadd $%zu, %%rsp\n", stack_size - old_stack);
-		stack_size = old_stack;
-	}
+	end_block(old_stack);
 }
 
 /* Process a function body */
@@ -808,18 +829,16 @@ void function_body(struct value *fun)
 	/* Create values for arguments */
 	struct value *values = NULL;
 	struct value *arg;
-	int loc = RDI;
+	int reg = RDI;
 	for (arg = fun->args; arg != NULL; arg = arg->next) {
 		struct value *val = calloc(1, sizeof(*val));
 		*val = *arg;
-		val->loc = loc;
-		val->storage = STOR_REGISTER;
-		registers[loc] = val;
+		registers[reg] = val;
 		val->next = values;
 		values = val;
 		val->next = symtab;
 		symtab = val;
-		loc--;
+		reg--;
 	}
 
 	printf("\t.global %s\n", fun->ident);
@@ -834,7 +853,6 @@ void function_body(struct value *fun)
 		arg = values;
 		values = arg->next;
 		drop(arg);
-		free(arg);
 	}
 
 	printf("\tpop %%rbx\n");
@@ -864,7 +882,6 @@ int main(int argc, char **argv)
 			error("expected a declaration\n");
 		if (lookup(val->ident) != NULL)
 			error("already defined: %s\n", val->ident);
-		val->storage = STOR_GLOBAL;
 		val->next = symtab;
 		symtab = val;
 		if (token == '{') {
