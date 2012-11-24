@@ -764,6 +764,16 @@ void statement()
 	}
 }
 
+void close_scope(struct value *position)
+{
+	while (symtab != position) {
+		struct value *val = symtab;
+		symtab = val->next;
+		free(val->ident);
+		free(val);
+	}
+}
+
 void block()
 {
 	/* Remember current symbol table so we can revert it */
@@ -777,7 +787,7 @@ void block()
 	} else
 		statement();
 
-	symtab = old_sym;
+	close_scope(old_sym);
 
 	/* Clean up allocated stack space */
 	if (stack_size > old_stack) {
@@ -830,7 +840,7 @@ void function_body(struct value *fun)
 	printf("\tpop %%rbx\n");
 	printf("\tret\n");
 
-	symtab = old_sym;
+	close_scope(old_sym);
 }
 
 int main(int argc, char **argv)
@@ -866,10 +876,15 @@ int main(int argc, char **argv)
 
 	/* Write string table */
 	printf("\t.data\n");
-	struct string *s;
-	for (s = stringtab; s != NULL; s = s->next) {
+	while (stringtab != NULL) {
+		struct string *s = stringtab;
+		stringtab = s->next;
 		printf("l%d: .string \"%s\"\n", s->label, s->buf);
+		free(s->buf);
+		free(s);
 	}
+
+	close_scope(NULL);
 
 	fclose(source);
 	return 0;
