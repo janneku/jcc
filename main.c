@@ -729,10 +729,6 @@ void block()
 		printf("add $%zu, %%rsp\n", stack_size - old_stack);
 		stack_size = old_stack;
 	}
-	int i;
-	for (i = 0; i < MAX_REG; ++i) {
-		assert(registers[i] == NULL);
-	}
 }
 
 /* Process a function body */
@@ -745,6 +741,7 @@ void function_body(struct value *fun)
 	struct value *old_sym = symtab;
 
 	/* Create values for arguments */
+	struct value *values = NULL;
 	struct value *arg;
 	int loc = RDI;
 	for (arg = fun->args; arg != NULL; arg = arg->next) {
@@ -753,12 +750,11 @@ void function_body(struct value *fun)
 		val->loc = loc;
 		val->storage = STOR_REGISTER;
 		registers[loc] = val;
+		val->next = values;
+		values = val;
 		val->next = symtab;
 		symtab = val;
 		loc--;
-		if (token != ')') {
-			expect(',');
-		}
 	}
 
 	printf(".global %s\n", fun->ident);
@@ -767,6 +763,14 @@ void function_body(struct value *fun)
 
 	stack_size = 8; /* because EBX is stored in stack */
 	block();
+
+	/* Clean up arguments */
+	while (values != NULL) {
+		arg = values;
+		values = arg->next;
+		drop(arg);
+		free(arg);
+	}
 
 	printf("pop %%rbx\n");
 	printf("ret\n");
