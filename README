@@ -3,3 +3,29 @@ Copyright 2012 Janne Kulmala <janne.t.kulmala@iki.fi>
 
 Program code is licensed with GNU LGPL 2.1. See COPYING.LGPL file.
 
+The generated code uses GNU assembler syntax.
+
+Implemented:
+  - Register allocation
+  - Type system with following types: void/char/int
+  - Basic arithmetic
+  - if() {}
+  - while() {}
+  - Function calls
+  - Function arguments
+  - Strings
+  - Initial support for pointers
+
+Missing features:
+  - Automatic type conversion
+  - Bit operations
+  - else branch to if
+  - Logic || &&
+  - Proper type preferences
+  - Assigment operators
+  - Structs
+  - Arrays
+  - Typedefs
+  - do {} while()
+  - for() loops
+  - Type casting
