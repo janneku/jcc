@@ -1,0 +1,5 @@
+jcc - Small C compiler for x86-64
+Copyright 2012 Janne Kulmala <janne.t.kulmala@iki.fi>
+
+Program code is licensed with GNU LGPL 2.1. See COPYING.LGPL file.
+
