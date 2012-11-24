@@ -446,6 +446,7 @@ struct value *term()
 		result = term();
 		load(result, -1);
 		printf("neg %s\n", reg(result));
+		result->locked = 0;
 		break;
 
 	case TOK_IDENTIFIER: {
@@ -551,6 +552,7 @@ struct value *binop_expr()
 			assert(0);
 		}
 		result = lhs;
+		result->locked = 0;
 		drop(rhs);
 		free(rhs);
 	}
@@ -584,8 +586,10 @@ struct value *expr()
 			assert(0);
 		}
 		/* The value is passed through */
+		drop(target);
 		free(target);
 		result = val;
+		result->locked = 0;
 	}
 	return result;
 }
