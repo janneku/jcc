@@ -36,6 +36,7 @@ enum {
 
 /* Storages */
 enum {
+	STOR_CONSTANT,
 	STOR_REGISTER,
 	STOR_GLOBAL,
 	STOR_STACK,
@@ -65,6 +66,7 @@ struct value {
 	int return_type; /* Return type for functions */
 	int storage;
 	int locked; /* Is locked to the register? */
+	unsigned long value; /* constant value */
 	size_t loc; /* register number or stack position */
 	int varargs; /* Function uses variable arguments */
 	struct value *args; /* function != 0 */
@@ -82,7 +84,7 @@ struct value *symtab = NULL;
 struct string *stringtab = NULL;
 int token, look;
 size_t stack_size;
-unsigned token_value;
+unsigned long token_value;
 char *token_str = NULL;
 struct value *registers[MAX_REG] = {};
 int return_stmt;
@@ -234,7 +236,7 @@ void push(struct value *val)
 	if (val->storage == STOR_REGISTER) {
 		assert(!val->locked);
 		assert(registers[val->loc] == val);
-		printf("push %s\n", reg(val));
+		printf("\tpush %s\n", reg(val));
 		registers[val->loc] = NULL;
 		stack_size += 8;
 		val->loc = stack_size;
@@ -292,16 +294,19 @@ void load(struct value *val, int loc)
 	}
 
 	switch (val->storage) {
+	case STOR_CONSTANT:
+		printf("\tmov $%zu, %s\n", val->value, reg_names[loc]);
+		break;
 	case STOR_REGISTER:
 		assert(registers[val->loc] == val);
 		registers[val->loc] = NULL;
-		printf("mov %s, %s\n", reg(val), reg_names[loc]);
+		printf("\tmov %s, %s\n", reg(val), reg_names[loc]);
 		break;
 	case STOR_GLOBAL:
-		printf("mov %s, %s\n", val->ident, reg_names[loc]);
+		printf("\tmov %s, %s\n", val->ident, reg_names[loc]);
 		break;
 	case STOR_STACK:
-		printf("mov %zu(%%rsp), %s\n", stack_size - val->loc,
+		printf("\tmov %zu(%%rsp), %s\n", stack_size - val->loc,
 			reg_names[loc]);
 		break;
 	default:
@@ -413,11 +418,11 @@ void function_call(struct value *fun)
 	/* The stack must be aligned to 16 after call */
 	size_t align = (stack_size + 8) % 16;
 	if (align > 0) {
-		printf("sub $%zd, %%rsp\n", 16 - align);
+		printf("\tsub $%zd, %%rsp\n", 16 - align);
 		stack_size += 16 - align;
 	}
 
-	printf("call %s\n", fun->ident);
+	printf("\tcall %s\n", fun->ident);
 	while (values != NULL) {
 		arg = values;
 		values = arg->next;
@@ -445,7 +450,7 @@ struct value *term()
 		lex();
 		result = term();
 		load(result, -1);
-		printf("neg %s\n", reg(result));
+		printf("\tneg %s\n", reg(result));
 		result->locked = 0;
 		break;
 
@@ -473,11 +478,9 @@ struct value *term()
 	case TOK_NUMBER: {
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
-			result->loc = alloc_register();
 			result->type = TYPE_INT;
-			result->storage = STOR_REGISTER;
-			registers[result->loc] = result;
-			printf("mov $%u, %s\n", token_value, reg(result));
+			result->value = token_value;
+			result->storage = STOR_CONSTANT;
 			lex();
 			break;
 		}
@@ -500,7 +503,7 @@ struct value *term()
 			result->loc = alloc_register();
 			result->storage = STOR_REGISTER;
 			registers[result->loc] = result;
-			printf("mov $l%d, %s\n", s->label, reg(result));
+			printf("\tmov $l%d, %s\n", s->label, reg(result));
 			break;
 		}
 
@@ -530,23 +533,23 @@ struct value *binop_expr()
 		load(rhs, -1);
 		switch (oper) {
 		case '+':
-			printf("add %s, %s\n", reg(rhs), reg(lhs));
+			printf("\tadd %s, %s\n", reg(rhs), reg(lhs));
 			break;
 		case '-':
-			printf("sub %s, %s\n", reg(rhs), reg(lhs));
+			printf("\tsub %s, %s\n", reg(rhs), reg(lhs));
 			break;
 		case '*':
-			printf("imul %s, %s\n", reg(rhs), reg(lhs));
+			printf("\timul %s, %s\n", reg(rhs), reg(lhs));
 			break;
 		case '<':
-			printf("cmp %s, %s\n", reg(rhs), reg(lhs));
-			printf("setl %s\n", bytereg(result));
-			printf("movzx %s, %s\n", bytereg(result), reg(result));
+			printf("\tcmp %s, %s\n", reg(rhs), reg(lhs));
+			printf("\tsetl %s\n", bytereg(result));
+			printf("\tmovzx %s, %s\n", bytereg(result), reg(result));
 			break;
 		case '>':
-			printf("cmp %s, %s\n", reg(rhs), reg(lhs));
-			printf("setg %s\n", bytereg(result));
-			printf("movzx %s, %s\n", bytereg(result), reg(result));
+			printf("\tcmp %s, %s\n", reg(rhs), reg(lhs));
+			printf("\tsetg %s\n", bytereg(result));
+			printf("\tmovzx %s, %s\n", bytereg(result), reg(result));
 			break;
 		default:
 			assert(0);
@@ -576,10 +579,10 @@ struct value *expr()
 		load(val, -1);
 		switch (target->storage) {
 		case STOR_GLOBAL:
-			printf("mov %s, %s\n", reg(val), target->ident);
+			printf("\tmov %s, %s\n", reg(val), target->ident);
 			break;
 		case STOR_STACK:
-			printf("mov %s, %zu(%%rsp)\n", reg(val),
+			printf("\tmov %s, %zu(%%rsp)\n", reg(val),
 				stack_size - target->loc);
 			break;
 		default:
@@ -606,9 +609,9 @@ void if_statement()
 	/* Compare the condition against zero */
 	int skip_label = next_label++;
 	load(condition, -1);
-	printf("or %s, %s\n", reg(condition),
+	printf("\tor %s, %s\n", reg(condition),
 		reg(condition));
-	printf("jz l%d\n", skip_label);
+	printf("\tjz l%d\n", skip_label);
 	drop(condition);
 	free(condition);
 
@@ -630,16 +633,16 @@ void while_statement()
 	/* Compare the condition against zero */
 	int end_label = next_label++;
 	load(condition, -1);
-	printf("or %s, %s\n", reg(condition),
+	printf("\tor %s, %s\n", reg(condition),
 		reg(condition));
-	printf("jz l%d\n", end_label);
+	printf("\tjz l%d\n", end_label);
 	drop(condition);
 	free(condition);
 
 	block();
 
 	/* Jump back to test the condition again */
-	printf("jmp l%d\n", begin_label);
+	printf("\tjmp l%d\n", begin_label);
 	printf("l%d:\n", end_label);
 }
 
@@ -652,9 +655,9 @@ void return_statement()
 
 	/* Clear up the stack and return to caller */
 	if (stack_size > 8)
-		printf("add $%zu, %%rsp\n", stack_size - 8);
-	printf("pop %%rbx\n");
-	printf("ret\n");
+		printf("\tadd $%zu, %%rsp\n", stack_size - 8);
+	printf("\tpop %%rbx\n");
+	printf("\tret\n");
 	drop(val);
 	free(val);
 }
@@ -683,13 +686,13 @@ void statement()
 				var->storage = STOR_STACK;
 				var->next = symtab;
 				symtab = var;
-				printf("sub $8, %%rsp\n");
+				printf("\tsub $8, %%rsp\n");
 
 				if (check('=')) {
 					/* Initialization */
 					struct value *val = expr();
 					load(val, -1);
-					printf("mov %s, %zu(%%rsp)\n",
+					printf("\tmov %s, %zu(%%rsp)\n",
 						reg(val),
 						stack_size - var->loc);
 					free(val);
@@ -726,7 +729,7 @@ void block()
 
 	/* Clean up allocated stack space */
 	if (stack_size > old_stack) {
-		printf("add $%zu, %%rsp\n", stack_size - old_stack);
+		printf("\tadd $%zu, %%rsp\n", stack_size - old_stack);
 		stack_size = old_stack;
 	}
 }
@@ -757,9 +760,9 @@ void function_body(struct value *fun)
 		loc--;
 	}
 
-	printf(".global %s\n", fun->ident);
+	printf("\t.global %s\n", fun->ident);
 	printf("%s:\n", fun->ident);
-	printf("push %%rbx\n");
+	printf("\tpush %%rbx\n");
 
 	stack_size = 8; /* because EBX is stored in stack */
 	block();
@@ -772,8 +775,8 @@ void function_body(struct value *fun)
 		free(arg);
 	}
 
-	printf("pop %%rbx\n");
-	printf("ret\n");
+	printf("\tpop %%rbx\n");
+	printf("\tret\n");
 
 	symtab = old_sym;
 }
@@ -792,7 +795,7 @@ int main(int argc, char **argv)
 	look = fgetc(source);
 	lex();
 
-	printf(".text\n");
+	printf("\t.text\n");
 	while (token != EOF) {
 		struct value *val = parse_declaration();
 		if (val == NULL)
@@ -810,7 +813,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Write string table */
-	printf(".data\n");
+	printf("\t.data\n");
 	struct string *s;
 	for (s = stringtab; s != NULL; s = s->next) {
 		printf("l%d: .string \"%s\"\n", s->label, s->buf);
