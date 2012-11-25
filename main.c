@@ -67,8 +67,8 @@ struct value {
 	char *ident; /* identifier (also global name) */
 	int type;
 	int constant;
-	int size; /* Size of the integer */
-	int return_type; /* Return type for functions or pointers */
+	size_t size; /* Size of the type */
+	struct value *target; /* Return type for functions or pointers */
 	unsigned long value; /* constant value */
 	size_t stack_pos;
 	int varargs; /* Function uses variable arguments */
@@ -91,24 +91,6 @@ unsigned long token_value;
 char *token_str = NULL;
 struct value *registers[MAX_REG] = {};
 int reg_locked[MAX_REG] = {};
-
-size_t size_of(const struct value *val)
-{
-	switch (val->type) {
-	case TYPE_VOID:
-		error("can not take size of void\n");
-		break;
-	case TYPE_FUNCTION:
-		error("can not take size of a function\n");
-		break;
-	case TYPE_INT:
-		return val->size;
-	case TYPE_POINTER:
-		return 8;
-	default:
-		assert(0);
-	}
-}
 
 /* Search for the register where the value is stored */
 int search_reg(const struct value *val)
@@ -345,26 +327,23 @@ size_t alloc_register()
 	return -1;
 }
 
+/* Returns a register with size from the given value */
 const char *asm_reg(const struct value *val, int reg)
 {
-	switch (val->type) {
-	case TYPE_POINTER:
-		return reg_names[reg];
-	case TYPE_INT:
-		switch (val->size) {
-		case 1:
-			return reg_byte_names[reg];
-		case 2:
-			return reg_word_names[reg];
-		case 4:
-			return reg_dword_names[reg];
-		case 8:
-			return reg_names[reg];
-		default:
-			assert(0);
-		}
-	default:
+	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION)
 		error("non-numeric type for expression\n");
+
+	switch (val->size) {
+	case 1:
+		return reg_byte_names[reg];
+	case 2:
+		return reg_word_names[reg];
+	case 4:
+		return reg_dword_names[reg];
+	case 8:
+		return reg_names[reg];
+	default:
+		assert(0);
 	}
 	return NULL;
 }
@@ -483,10 +462,13 @@ struct value *parse_declaration()
 	if (val->size == 0)
 		val->size = 4;
 
-	if (check('*')) {
+	while (check('*')) {
 		/* A pointer */
-		val->return_type = val->type;
+		struct value *target = val;
+		val = calloc(1, sizeof(*val));
 		val->type = TYPE_POINTER;
+		val->size = 8;
+		val->target = target;
 	}
 
 	if (token == TOK_IDENTIFIER) {
@@ -497,8 +479,12 @@ struct value *parse_declaration()
 
 	if (check('(')) {
 		/* It's a function. Parse function parameters */
-		val->return_type = val->type;
+		struct value *target = val;
+		val = calloc(1, sizeof(*val));
 		val->type = TYPE_FUNCTION;
+		val->ident = target->ident;
+		target->ident = NULL;
+		val->target = target;
 
 		struct value *last_arg = NULL;
 		while (!check(')')) {
@@ -607,8 +593,9 @@ struct value *term()
 
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
-			result->type = pointer->return_type;
-			result->size = pointer->size;
+			result->type = pointer->target->type;
+			result->size = pointer->target->size;
+			result->target = pointer->target->target;
 			printf("\tmov (%s), %s\n", asm_reg(pointer, reg),
 				asm_reg(result, out_reg));
 			registers[out_reg] = result;
@@ -638,6 +625,7 @@ struct value *term()
 			assert(result != NULL);
 			result->type = val->type;
 			result->size = val->size;
+			result->target = val->target;
 			registers[reg] = result;
 			break;
 		}
@@ -652,8 +640,9 @@ struct value *term()
 			function_call(fun);
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
-			result->type = fun->return_type;
-			result->size = fun->size;
+			result->type = fun->target->type;
+			result->size = fun->target->size;
+			result->target = fun->target->target;
 			if (result->type != TYPE_VOID) {
 				registers[RAX] = result;
 			}
@@ -683,12 +672,17 @@ struct value *term()
 			stringtab = s;
 			lex();
 
-			/* Get address to the string */
+			/* construct "char *" type */
+			struct value *target = calloc(1, sizeof(*target));
+			assert(target != NULL);
+			target->type = TYPE_INT;
+			target->size = 1;
+
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = TYPE_POINTER;
-			result->return_type = TYPE_INT;
-			result->size = 1;
+			result->size = 8;
+			result->target = target;
 			int reg = alloc_register();
 			printf("\tmov $l%d, %s\n", s->label,
 				asm_reg(result, reg));
@@ -708,7 +702,8 @@ struct value *binop_expr()
 	struct value *result = term();
 	while (1) {
 		int oper;
-		if (token == '+' || token == '-' || token == '*') {
+		if (token == '+' || token == '-' || token == '*' ||
+		    token == '&' || token == '|') {
 			oper = token;
 		} else
 			break;
@@ -731,6 +726,14 @@ struct value *binop_expr()
 			printf("\timul %s, %s\n", asm_operand(rhs),
 				asm_reg(lhs, reg));
 			break;
+		case '&':
+			printf("\tand %s, %s\n", asm_operand(rhs),
+				asm_reg(lhs, reg));
+			break;
+		case '|':
+			printf("\tor %s, %s\n", asm_operand(rhs),
+				asm_reg(lhs, reg));
+			break;
 		default:
 			assert(0);
 		}
@@ -741,6 +744,7 @@ struct value *binop_expr()
 		assert(result != NULL);
 		result->type = lhs->type;
 		result->size = lhs->size;
+		result->target = lhs->target;
 		registers[reg] = result;
 	}
 	return result;
@@ -808,6 +812,8 @@ struct value *expr()
 		struct value *target = result;
 
 		struct value *val = expr();
+		if (target->type != val->type)
+			error("type mismatch in assigment\n");
 
 		int reg = load(val, -1);
 		printf("\tmov %s, %s\n", asm_reg(val, reg),
@@ -981,6 +987,20 @@ void return_statement()
 	drop(val);
 }
 
+/* Initialization inside variable declaration */
+void initialize_variable(struct value *var)
+{
+	struct value *init = expr();
+	if (var->type != init->type)
+		error("initialization type mismatch\n");
+
+	int reg = load(init, -1);
+	printf("\tmov %s, %zu(%%rsp)\n", asm_reg(init, reg),
+		stack_size - var->stack_pos);
+	reg_locked[reg] = 0;
+	drop(init);
+}
+
 void statement()
 {
 	switch (token) {
@@ -1004,20 +1024,14 @@ void statement()
 			struct value *var = parse_declaration();
 			if (var != NULL) {
 				/* It's a variable declaration */
-				stack_size += size_of(var);
+				stack_size += var->size;
 				var->stack_pos = stack_size;
 				var->next = symtab;
 				symtab = var;
-				printf("\tsub $%zu, %%rsp\n", size_of(var));
+				printf("\tsub $%zu, %%rsp\n", var->size);
 
 				if (check('=')) {
-					/* Initialization */
-					struct value *init = expr();
-					int reg = load(init, -1);
-					printf("\tmov %s, %zu(%%rsp)\n",
-						asm_reg(init, reg),
-						stack_size - var->stack_pos);
-					drop(init);
+					initialize_variable(var);
 				}
 			} else {
 				/* It's an expression. Throw the result away */

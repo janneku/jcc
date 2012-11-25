@@ -25,6 +25,12 @@ void rot13(char *s)
 	}
 }
 
-int main() {
-	rot13("Hello, world!\n");
+int main(int argc, char **argv) {
+	char **args = argv;
+	if (argc < 2) {
+		printf("Usage: %s [text]\n", *argv);
+		return 0;
+	}
+	rot13(*(args + 8));
+	printf("\n");
 }
