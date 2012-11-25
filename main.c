@@ -525,11 +525,12 @@ void function_call(struct value *fun)
 
 	/* Then, arrange the values for x86-64 call convention */
 	for (i = 0; i < MAX_REG; ++i) {
+		int reg = RDI - i;
 		if (values[i] != NULL) {
-			load(values[i], RDI - i);
-		} else if (registers[RDI - i] != NULL) {
-			/* Reserve all other registers */
-			push(RDI - i);
+			load(values[i], reg);
+		} else if (reg != RBX && registers[reg] != NULL) {
+			/* All registers can be modified, except RBX */
+			push(reg);
 		}
 	}
 
@@ -570,16 +571,19 @@ struct value *term()
 			if (pointer->type != TYPE_POINTER)
 				error("trying to dereference a non-pointer\n");
 
+			/* We can use overlapping allocations */
 			int reg = load(pointer, -1);
+			drop(pointer);
+			reg_locked[reg] = 0;
+			int out_reg = alloc_register();
+
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = pointer->return_type;
 			result->size = pointer->size;
 			printf("\tmov (%s), %s\n", asm_reg(pointer, reg),
-				asm_reg(result, reg));
-			reg_locked[reg] = 0;
-			drop(pointer);
-			registers[reg] = result;
+				asm_reg(result, out_reg));
+			registers[out_reg] = result;
 			break;
 		}
 
@@ -728,9 +732,15 @@ struct value *relational_expr()
 		struct value *lhs = result;
 		struct value *rhs = binop_expr();
 
+		/* We can use overlapping allocations */
 		int reg = load(lhs, -1);
 		printf("\tcmp %s, %s\n", asm_operand(rhs), asm_reg(lhs, reg));
+		reg_locked[reg] = 0;
+		drop(lhs);
+		drop(rhs);
+		reg = alloc_register();
 
+		/* These require a byte register */
 		switch (oper) {
 		case '<':
 			printf("\tsetl %s\n", reg_byte_names[reg]);
@@ -741,10 +751,6 @@ struct value *relational_expr()
 		default:
 			assert(0);
 		}
-
-		reg_locked[reg] = 0;
-		drop(lhs);
-		drop(rhs);
 		result = calloc(1, sizeof(*result));
 		assert(result != NULL);
 		result->type = TYPE_INT;
@@ -778,7 +784,14 @@ struct value *expr()
 	return result;
 }
 
-void end_block(size_t old_stack)
+/* Reset contents of registers. Must be called after a label */
+void reset_registers()
+{
+	memset(registers, 0, sizeof registers);
+}
+
+/* Rewinds stack to a previous state. */
+void reset_stack(size_t old_stack)
 {
 	/* Clean up allocated stack space */
 	if (stack_size > old_stack) {
@@ -793,9 +806,6 @@ void end_block(size_t old_stack)
 			val->stack_pos = 0;
 		val = val->next;
 	}
-
-	/* Reset registers */
-	memset(registers, 0, sizeof registers);
 }
 
 void block();
@@ -811,7 +821,7 @@ void if_statement()
 
 	int reg = load(condition, -1);
 	drop(condition);
-	end_block(old_stack);
+	reset_stack(old_stack);
 
 	/* Compare the condition against zero (still in register) */
 	int skip_label = next_label++;
@@ -826,12 +836,15 @@ void if_statement()
 		int end_label = next_label++;
 		printf("\tjmp l%d\n", end_label);
 		printf("l%d:\n", skip_label);
+		reset_registers();
 
 		block();
 
 		printf("l%d:\n", end_label);
+		reset_registers();
 	} else {
 		printf("l%d:\n", skip_label);
+		reset_registers();
 	}
 }
 
@@ -841,6 +854,7 @@ void while_statement()
 
 	int test_label = next_label++;
 	printf("l%d:\n", test_label);
+	reset_registers();
 
 	/* The condition block must leave the state exactly the same */
 	size_t old_stack = stack_size;
@@ -849,7 +863,7 @@ void while_statement()
 
 	int reg = load(condition, -1);
 	drop(condition);
-	end_block(old_stack);
+	reset_stack(old_stack);
 
 	/* Compare the condition against zero */
 	int end_label = next_label++;
@@ -862,6 +876,7 @@ void while_statement()
 	/* Jump back to test the condition again */
 	printf("\tjmp l%d\n", test_label);
 	printf("l%d:\n", end_label);
+	reset_registers();
 }
 
 void for_statement()
@@ -874,6 +889,7 @@ void for_statement()
 
 	int test_label = next_label++;
 	printf("l%d:\n", test_label);
+	reset_registers();
 
 	/* The condition block must leave the state exactly the same */
 	size_t old_stack = stack_size;
@@ -883,7 +899,7 @@ void for_statement()
 	/* Compare the condition against zero */
 	int reg = load(condition, -1);
 	drop(condition);
-	end_block(old_stack);
+	reset_stack(old_stack);
 
 	int end_label = next_label++;
 	int begin_label = next_label++;
@@ -894,21 +910,24 @@ void for_statement()
 
 	int step_label = next_label++;
 	printf("l%d:\n", step_label);
+	reset_registers();
 
 	old_stack = stack_size;
 	struct value *step = expr();
 	expect(')');
 	drop(step);
-	end_block(old_stack);
+	reset_stack(old_stack);
 	printf("\tjmp l%d\n", test_label);
 
 	printf("l%d:\n", begin_label);
+	reset_registers();
 
 	block();
 
 	/* Jump back to step after which test the condition */
 	printf("\tjmp l%d\n", step_label);
 	printf("l%d:\n", end_label);
+	reset_registers();
 }
 
 void return_statement()
@@ -999,7 +1018,7 @@ void block()
 		statement();
 
 	close_scope(old_sym);
-	end_block(old_stack);
+	reset_stack(old_stack);
 }
 
 /* Process a function body */
