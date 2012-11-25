@@ -25,10 +25,14 @@ enum {
 	TOK_STRUCT,
 	TOK_TYPEDEF,
 	TOK_VOID,
+
 	TOK_IDENTIFIER,
+	TOK_CHAR_LITERAL,
 	TOK_NUMBER,
 	TOK_STRING,
 	TOK_ELLIPSIS,
+	TOK_GREATER_EQ,
+	TOK_LESS_EQ,
 };
 
 /* Types */
@@ -242,13 +246,37 @@ void lex()
 		token_str = parse_string();
 		token = TOK_STRING;
 
+	} else if (look == '\'') {
+		look = fgetc(source);
+		token_value = look;
+		look = fgetc(source);
+		if (look != '\'')
+			error("expected '\'', got '%c'\n", look);
+		look = fgetc(source);
+		token = TOK_CHAR_LITERAL;
+
 	} else if (look == '.') {
+		token = look;
 		look = fgetc(source);
 		if (look == '.') {
 			token = TOK_ELLIPSIS;
 			look = fgetc(source);
-		} else {
-			token = '.';
+		}
+
+	} else if (look == '>') {
+		token = look;
+		look = fgetc(source);
+		if (look == '=') {
+			token = TOK_GREATER_EQ;
+			look = fgetc(source);
+		}
+
+	} else if (look == '<') {
+		token = look;
+		look = fgetc(source);
+		if (look == '=') {
+			token = TOK_LESS_EQ;
+			look = fgetc(source);
 		}
 
 	} else {
@@ -632,6 +660,7 @@ struct value *term()
 		}
 		break;
 
+	case TOK_CHAR_LITERAL:
 	case TOK_NUMBER: {
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
@@ -723,7 +752,8 @@ struct value *relational_expr()
 	struct value *result = binop_expr();
 	while (1) {
 		int oper;
-		if (token == '<' || token == '>') {
+		if (token == '<' || token == '>' || token == TOK_GREATER_EQ ||
+		    token == TOK_LESS_EQ) {
 			oper = token;
 		} else
 			break;
@@ -747,6 +777,12 @@ struct value *relational_expr()
 			break;
 		case '>':
 			printf("\tsetg %s\n", reg_byte_names[reg]);
+			break;
+		case TOK_GREATER_EQ:
+			printf("\tsetge %s\n", reg_byte_names[reg]);
+			break;
+		case TOK_LESS_EQ:
+			printf("\tsetle %s\n", reg_byte_names[reg]);
 			break;
 		default:
 			assert(0);
@@ -1063,6 +1099,7 @@ void function_body(struct value *fun)
 	printf("\tret\n");
 
 	close_scope(old_sym);
+	reset_registers();
 }
 
 int main(int argc, char **argv)
