@@ -25,10 +25,12 @@ enum {
 	TOK_STRUCT,
 	TOK_TYPEDEF,
 	TOK_VOID,
+	TOK_SIZEOF,
 
 	TOK_IDENTIFIER,
 	TOK_CHAR_LITERAL,
 	TOK_NUMBER,
+	TOK_ARROW,
 	TOK_STRING,
 	TOK_ELLIPSIS,
 	TOK_GREATER_EQ,
@@ -38,6 +40,7 @@ enum {
 /* Types */
 enum {
 	TYPE_VOID,
+	TYPE_STRUCT,
 	TYPE_FUNCTION,
 	TYPE_POINTER,
 	TYPE_INT,
@@ -64,15 +67,17 @@ const char *reg_byte_names[] = {"%al", "%bl", "%cl", "%dl", "%sil", "%dil"};
 
 struct value {
 	struct value *next;
-	char *ident; /* identifier (also global name) */
+	char *ident; /* identifier (also name of global storage) */
 	int type;
 	int constant;
+	unsigned long value; /* constant value */
 	size_t size; /* Size of the type */
 	struct value *target; /* Return type for functions or pointers */
-	unsigned long value; /* constant value */
-	size_t stack_pos;
+	size_t stack_pos; /* Position in stack */
+	size_t offset; /* struct offset */
 	int varargs; /* Function uses variable arguments */
-	struct value *args; /* function != 0 */
+	struct value *parent;
+	struct value *args; /* function arguments or struct members */
 };
 
 struct string {
@@ -106,6 +111,10 @@ int search_reg(const struct value *val)
 /* Called when a value is no longer needed. */
 void drop(const struct value *val)
 {
+	if (val->parent != NULL)
+		drop(val->parent);
+
+	/* Heuristics: keep non-temporary values in registers */
 	if (val->stack_pos > 0 || val->ident != NULL)
 		return;
 	int i;
@@ -115,12 +124,13 @@ void drop(const struct value *val)
 	}
 }
 
+/* Count the number of copies of the given value */
 int copies(const struct value *val)
 {
 	int count = 0;
 	if (val->constant)
 		count++;
-	if (val->stack_pos > 0)
+	if (val->stack_pos > 0) /* In stack */
 		count++;
 	else if (val->ident != NULL)
 		count++;
@@ -207,6 +217,8 @@ void lex()
 			token = TOK_TYPEDEF;
 		else if (strcmp(buf, "void") == 0)
 			token = TOK_VOID;
+		else if (strcmp(buf, "sizeof") == 0)
+			token = TOK_SIZEOF;
 		else {
 			token_str = buf;
 			buf = NULL;
@@ -242,6 +254,14 @@ void lex()
 		look = fgetc(source);
 		if (look == '.') {
 			token = TOK_ELLIPSIS;
+			look = fgetc(source);
+		}
+
+	} else if (look == '-') {
+		token = look;
+		look = fgetc(source);
+		if (look == '>') {
+			token = TOK_ARROW;
 			look = fgetc(source);
 		}
 
@@ -286,10 +306,10 @@ void expect(int c)
 }
 
 /* Looks up a symbol by the identifier. */
-struct value *lookup(const char *ident)
+struct value *lookup(struct value *list, const char *ident)
 {
 	struct value *s;
-	for (s = symtab; s != NULL; s = s->next) {
+	for (s = list; s != NULL; s = s->next) {
 		if (strcmp(s->ident, ident) == 0)
 			return s;
 	}
@@ -330,7 +350,8 @@ size_t alloc_register()
 /* Returns a register with size from the given value */
 const char *asm_reg(const struct value *val, int reg)
 {
-	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION)
+	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION ||
+	    val->type == TYPE_STRUCT)
 		error("non-numeric type for expression\n");
 
 	switch (val->size) {
@@ -348,12 +369,15 @@ const char *asm_reg(const struct value *val, int reg)
 	return NULL;
 }
 
+int load(struct value *val, int reg);
+
 /* Returns operand for printing. */
 const char *asm_operand(const struct value *val)
 {
 	static char buf[64];
 
-	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION)
+	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION ||
+	    val->type == TYPE_STRUCT)
 		error("non-numeric type for expression\n");
 
 	/* First, see if we have it in a register */
@@ -367,7 +391,20 @@ const char *asm_operand(const struct value *val)
 		return buf;
 	}
 
-	/* Finally, load from memory */
+	/* Finally, load from stack or global memory */
+
+	if (val->parent != NULL) {
+		/* It's a member of a structure */
+
+		assert(val->parent->type == TYPE_POINTER);
+
+		int reg = load(val->parent, -1);
+		reg_locked[reg] = 0;
+		sprintf(buf, "%zu(%s)", val->offset,
+			asm_reg(val->parent, reg));
+		return buf;
+	}
+
 	if (val->stack_pos > 0) {
 		sprintf(buf, "%zu(%%rsp)", stack_size - val->stack_pos);
 		return buf;
@@ -381,7 +418,8 @@ const char *asm_operand(const struct value *val)
 /* Loads a value into the given register. -1 means any register */
 int load(struct value *val, int reg)
 {
-	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION)
+	if (val->type == TYPE_VOID || val->type == TYPE_FUNCTION ||
+	    val->type == TYPE_STRUCT)
 		error("non-numeric type for expression\n");
 
 	if (reg < 0) {
@@ -406,6 +444,40 @@ int load(struct value *val, int reg)
 	registers[reg] = val;
 	reg_locked[reg] = 1;
 	return reg;
+}
+
+struct value *parse_declaration();
+
+/* Parse struct declaration */
+void parse_struct(struct value *stru)
+{
+	size_t offset = 0;
+
+	expect('{');
+	while (!check('}')) {
+		struct value *field = parse_declaration();
+		if (field == NULL)
+			error("expected a structure field declaration\n");
+
+		/* Align the field */
+		if (field->type == TYPE_STRUCT) {
+			size_t align = offset % 8;
+			if (align > 0) {
+				offset += 8 - align;
+			}
+		} else if (field->size > 0) {
+			size_t align = offset % field->size;
+			if (align > 0) {
+				offset += field->size - align;
+			}
+		}
+		field->offset = offset;
+		offset += field->size;
+		field->next = stru->args;
+		stru->args = field;
+		expect(';');
+	}
+	stru->size = offset;
 }
 
 /* Parses a C declaration, which are used for variables and types */
@@ -445,6 +517,14 @@ struct value *parse_declaration()
 				error("type already has a size\n");
 			val->size = 8;
 			break;
+		case TOK_STRUCT:
+			lex();
+			if (val->type >= 0)
+				error("already have a basic type\n");
+			val->type = TYPE_STRUCT;
+			parse_struct(val);
+			done = 1;
+			break;
 		default:
 			if (val->type < 0 && val->size == 0) {
 				/* Found nothing */
@@ -459,7 +539,7 @@ struct value *parse_declaration()
 	}
 	if (val->type < 0)
 		val->type = TYPE_INT;
-	if (val->size == 0)
+	if (val->type == TYPE_INT && val->size == 0)
 		val->size = 4;
 
 	while (check('*')) {
@@ -564,6 +644,56 @@ void function_call(struct value *fun)
 	}
 }
 
+/* Takes to address of given value */
+struct value *address_of(struct value *target)
+{
+	struct value *pointer = calloc(1, sizeof(*pointer));
+	assert(pointer != NULL);
+	pointer->type = TYPE_POINTER;
+	pointer->size = 8;
+	pointer->target = target;
+
+	if (target->parent != NULL) {
+		/* It's a member of a struct */
+
+		assert(target->parent->type == TYPE_POINTER);
+
+		int parent_reg = load(target->parent, -1);
+
+		/* Overlapping allocations */
+		reg_locked[parent_reg] = 0;
+		drop(target);
+		int reg = alloc_register();
+
+		printf("\tlea %zu(%s), %s\n", target->offset,
+			asm_reg(target->parent, parent_reg),
+			asm_reg(pointer, reg));
+		registers[reg] = pointer;
+
+	} else if (target->stack_pos > 0) {
+		/* It's in stack */
+		drop(target);
+		int reg = alloc_register();
+
+		printf("\tlea %zu(%%rsp), %s\n", stack_size - target->stack_pos,
+			asm_reg(pointer, reg));
+		registers[reg] = pointer;
+
+	} else if (target->ident != NULL) {
+		/* It's global */
+		drop(target);
+		int reg = alloc_register();
+
+		printf("\tmov $%s, %s\n", target->ident, asm_reg(pointer, reg));
+		registers[reg] = pointer;
+
+	} else {
+		error("trying to take the address of a temporary\n");
+	}
+
+	return pointer;
+}
+
 /* Parses a term, which is a part of an expression */
 struct value *term()
 {
@@ -576,6 +706,13 @@ struct value *term()
 				error("TODO: typecasting\n");
 			result = expr();
 			expect(')');
+			break;
+		}
+
+	case '&': { /* Address-of */
+			lex();
+			struct value *target = term();
+			result = address_of(target);
 			break;
 		}
 
@@ -630,8 +767,25 @@ struct value *term()
 			break;
 		}
 
+	case TOK_SIZEOF: {
+			lex();
+			struct value *type = parse_declaration();
+			if (type == NULL) {
+				type = term();
+			}
+			drop(type);
+
+			result = calloc(1, sizeof(*result));
+			assert(result != NULL);
+			result->type = TYPE_INT;
+			result->size = 8;
+			result->value = type->size;
+			result->constant = 1;
+			break;
+		}
+
 	case TOK_IDENTIFIER:
-		result = lookup(token_str);
+		result = lookup(symtab, token_str);
 		if (result == NULL)
 			error("undefined: %s\n", token_str);
 		lex();
@@ -693,6 +847,58 @@ struct value *term()
 	default:
 		error("syntax error in expression, got '%c'\n", token);
 	}
+
+	while (check('.')) {
+		/* Struct field reference */
+		if (result->type != TYPE_STRUCT)
+			error("struct type expected\n");
+
+		if (token != TOK_IDENTIFIER)
+			error("struct field identifier expected\n");
+
+		struct value *parent = address_of(result);
+
+		struct value *field = lookup(result->args, token_str);
+		if (field == NULL)
+			error("undefined struct field: '%s'\n", token_str);
+		lex();
+
+		result = calloc(1, sizeof(*result));
+		assert(result != NULL);
+		result->type = field->type;
+		result->size = field->size;
+		result->target = field->target;
+		result->offset = field->offset;
+		result->args = field->args;
+		result->parent = parent;
+	}
+
+	while (check(TOK_ARROW)) {
+		/* Struct field reference */
+		if (result->type != TYPE_POINTER &&
+		    result->target->type != TYPE_STRUCT)
+			error("pointer to a struct expected\n");
+
+		if (token != TOK_IDENTIFIER)
+			error("struct field identifier expected\n");
+
+		struct value *parent = result;
+
+		struct value *field = lookup(parent->target->args, token_str);
+		if (field == NULL)
+			error("undefined struct field: '%s'\n", token_str);
+		lex();
+
+		result = calloc(1, sizeof(*result));
+		assert(result != NULL);
+		result->type = field->type;
+		result->size = field->size;
+		result->target = field->target;
+		result->offset = field->offset;
+		result->args = field->args;
+		result->parent = parent;
+	}
+
 	return result;
 }
 
@@ -1135,7 +1341,7 @@ int main(int argc, char **argv)
 		struct value *val = parse_declaration();
 		if (val == NULL)
 			error("expected a declaration\n");
-		if (lookup(val->ident) != NULL)
+		if (lookup(symtab, val->ident) != NULL)
 			error("already defined: %s\n", val->ident);
 		val->next = symtab;
 		symtab = val;
@@ -1143,6 +1349,14 @@ int main(int argc, char **argv)
 			function_body(val);
 		} else {
 			expect(';');
+		}
+	}
+
+	/* Allocate BSS */
+	struct value *val;
+	for (val = symtab; val != NULL; val = val->next) {
+		if (val->type != TYPE_FUNCTION) {
+			printf("\t.lcomm %s, %zu\n", val->ident, val->size);
 		}
 	}
 
