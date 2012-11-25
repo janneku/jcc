@@ -8,6 +8,7 @@ The generated code uses GNU assembler syntax.
 Implemented:
   - Register allocation
   - Type system
+  - Pointers
   - char/short/long integer sizes
   - Basic arithmetic
   - if-else
@@ -16,7 +17,7 @@ Implemented:
   - Function calls
   - Function arguments
   - String literals
-  - Initial support for pointers
+  - Structs
 
 Missing features:
   - Automatic type conversion
@@ -24,7 +25,6 @@ Missing features:
   - Logic || &&
   - Proper type preferences
   - Assigment operators += -=
-  - Structs
   - Arrays
   - Typedefs
   - do {} while()
