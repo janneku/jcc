@@ -40,6 +40,7 @@ enum {
 /* Types */
 enum {
 	TYPE_VOID,
+	TYPE_STRUCT_DEF,
 	TYPE_STRUCT,
 	TYPE_FUNCTION,
 	TYPE_POINTER,
@@ -310,7 +311,18 @@ struct value *lookup(struct value *list, const char *ident)
 {
 	struct value *s;
 	for (s = list; s != NULL; s = s->next) {
-		if (strcmp(s->ident, ident) == 0)
+		if (strcmp(s->ident, ident) == 0 && s->type != TYPE_STRUCT_DEF)
+			return s;
+	}
+	return NULL;
+}
+
+/* Struct definitions are in a separate namespace */
+struct value *lookup_struct(struct value *list, const char *ident)
+{
+	struct value *s;
+	for (s = list; s != NULL; s = s->next) {
+		if (strcmp(s->ident, ident) == 0 && s->type == TYPE_STRUCT_DEF)
 			return s;
 	}
 	return NULL;
@@ -449,11 +461,32 @@ int load(struct value *val, int reg)
 struct value *parse_declaration();
 
 /* Parse struct declaration */
-void parse_struct(struct value *stru)
+struct value *parse_struct()
 {
+	struct value *def;
+	if (token == TOK_IDENTIFIER) {
+		/* Merge definitions with the same name */
+		def = lookup_struct(symtab, token_str);
+		if (def == NULL) {
+			def = calloc(1, sizeof(*def));
+			def->type = TYPE_STRUCT_DEF;
+			def->ident = token_str;
+			token_str = NULL;
+			def->next = symtab;
+			symtab = def;
+		}
+		lex();
+	} else {
+		/* unnamed */
+		def = calloc(1, sizeof(*def));
+		def->type = TYPE_STRUCT_DEF;
+	}
+
+	if (!check('{'))
+		return def;
+
 	size_t offset = 0;
 
-	expect('{');
 	while (!check('}')) {
 		struct value *field = parse_declaration();
 		if (field == NULL)
@@ -473,11 +506,13 @@ void parse_struct(struct value *stru)
 		}
 		field->offset = offset;
 		offset += field->size;
-		field->next = stru->args;
-		stru->args = field;
+		field->next = def->args;
+		def->args = field;
 		expect(';');
 	}
-	stru->size = offset;
+	def->size = offset;
+
+	return def;
 }
 
 /* Parses a C declaration, which are used for variables and types */
@@ -522,7 +557,8 @@ struct value *parse_declaration()
 			if (val->type >= 0)
 				error("already have a basic type\n");
 			val->type = TYPE_STRUCT;
-			parse_struct(val);
+			val->target = parse_struct(val);
+			val->size = val->target->size;
 			done = 1;
 			break;
 		default:
@@ -858,7 +894,7 @@ struct value *term()
 
 		struct value *parent = address_of(result);
 
-		struct value *field = lookup(result->args, token_str);
+		struct value *field = lookup(result->target->args, token_str);
 		if (field == NULL)
 			error("undefined struct field: '%s'\n", token_str);
 		lex();
@@ -884,7 +920,7 @@ struct value *term()
 
 		struct value *parent = result;
 
-		struct value *field = lookup(parent->target->args, token_str);
+		struct value *field = lookup(parent->target->target->args, token_str);
 		if (field == NULL)
 			error("undefined struct field: '%s'\n", token_str);
 		lex();
@@ -1022,8 +1058,16 @@ struct value *expr()
 			error("type mismatch in assigment\n");
 
 		int reg = load(val, -1);
-		printf("\tmov %s, %s\n", asm_reg(val, reg),
-			asm_operand(target));
+		if (target->stack_pos > 0) {
+			printf("\tmov %s, %zu(%%rsp)\n", asm_reg(val, reg),
+				stack_size - target->stack_pos);
+		} else if (target->ident != NULL) {
+			printf("\tmov %s, %s\n", asm_reg(val, reg),
+				target->ident);
+		} else {
+			printf("\tmov %s, %s\n", asm_reg(val, reg),
+				asm_operand(target));
+		}
 		reg_locked[reg] = 0;
 
 		/* The value is passed through */
@@ -1341,6 +1385,10 @@ int main(int argc, char **argv)
 		struct value *val = parse_declaration();
 		if (val == NULL)
 			error("expected a declaration\n");
+		if (val->ident == NULL) {
+			expect(';');
+			continue;
+		}
 		if (lookup(symtab, val->ident) != NULL)
 			error("already defined: %s\n", val->ident);
 		val->next = symtab;
