@@ -556,14 +556,44 @@ struct value *term()
 				error("TODO: typecasting\n");
 			result = expr();
 			expect(')');
+			break;
 		}
-		break;
 
+	case '*': { /* Dereference */
+			lex();
+			struct value *pointer = term();
+			if (pointer->type != TYPE_POINTER)
+				error("trying to dereference a non-pointer\n");
+
+			int reg = load(pointer, -1);
+			result = calloc(1, sizeof(*result));
+			assert(result != NULL);
+			result->type = pointer->return_type;
+			result->size = pointer->size;
+			printf("\tmov (%s), %s\n", asm_reg(pointer, reg),
+				asm_reg(result, reg));
+			reg_locked[reg] = 0;
+			drop(pointer);
+			registers[reg] = result;
+			break;
+		}
+
+	case '~':
 	case '-': {
+			int op = token;
 			lex();
 			struct value *val = term();
 			int reg = load(val, -1);
-			printf("\tneg %s\n", asm_reg(val, reg));
+			switch (op) {
+			case '-':
+				printf("\tneg %s\n", asm_reg(val, reg));
+				break;
+			case '~':
+				printf("\tnot %s\n", asm_reg(val, reg));
+				break;
+			default:
+				assert(0);
+			}
 			reg_locked[reg] = 0;
 			drop(val);
 
@@ -586,6 +616,7 @@ struct value *term()
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = fun->return_type;
+			result->size = fun->size;
 			if (result->type != TYPE_VOID) {
 				registers[RAX] = result;
 			}
