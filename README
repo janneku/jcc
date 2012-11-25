@@ -7,13 +7,15 @@ The generated code uses GNU assembler syntax.
 
 Implemented:
   - Register allocation
-  - Type system with following types: void/char/int
+  - Type system
+  - char/short/long integer sizes
   - Basic arithmetic
   - if() {}
   - while() {}
+  - for() loops
   - Function calls
   - Function arguments
-  - Strings
+  - String literals
   - Initial support for pointers
 
 Missing features:
@@ -22,10 +24,9 @@ Missing features:
   - else branch to if
   - Logic || &&
   - Proper type preferences
-  - Assigment operators
+  - Assigment operators += -=
   - Structs
   - Arrays
   - Typedefs
   - do {} while()
-  - for() loops
   - Type casting

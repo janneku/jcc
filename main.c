@@ -19,6 +19,10 @@ enum {
 	TOK_RETURN,
 	TOK_CHAR,
 	TOK_INT,
+	TOK_SHORT,
+	TOK_LONG,
+	TOK_STRUCT,
+	TOK_TYPEDEF,
 	TOK_VOID,
 	TOK_IDENTIFIER,
 	TOK_NUMBER,
@@ -31,7 +35,6 @@ enum {
 	TYPE_VOID,
 	TYPE_FUNCTION,
 	TYPE_POINTER,
-	TYPE_CHAR,
 	TYPE_INT,
 };
 
@@ -50,6 +53,8 @@ enum {
 };
 
 const char *reg_names[] = {"%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi"};
+const char *reg_dword_names[] = {"%eax", "%ebx", "%ecx", "%edx", "%esi", "%edi"};
+const char *reg_word_names[] = {"%ax", "%bx", "%cx", "%dx", "%si", "%di"};
 const char *reg_byte_names[] = {"%al", "%bl", "%cl", "%dl", "%sil", "%dil"};
 
 struct value {
@@ -57,7 +62,8 @@ struct value {
 	char *ident; /* identifier (also global name) */
 	int type;
 	int constant;
-	int return_type; /* Return type for functions */
+	int size; /* Size of the integer */
+	int return_type; /* Return type for functions or pointers */
 	unsigned long value; /* constant value */
 	size_t stack_pos;
 	int varargs; /* Function uses variable arguments */
@@ -80,7 +86,24 @@ unsigned long token_value;
 char *token_str = NULL;
 struct value *registers[MAX_REG] = {};
 int reg_locked[MAX_REG] = {};
-int return_stmt;
+
+size_t size_of(const struct value *val)
+{
+	switch (val->type) {
+	case TYPE_VOID:
+		error("can not take size of void\n");
+		break;
+	case TYPE_FUNCTION:
+		error("can not take size of a function\n");
+		break;
+	case TYPE_INT:
+		return val->size;
+	case TYPE_POINTER:
+		return 8;
+	default:
+		assert(0);
+	}
+}
 
 /* Search for the register where the value is stored */
 int search_reg(const struct value *val)
@@ -107,10 +130,12 @@ void drop(const struct value *val)
 
 int copies(const struct value *val)
 {
-	if (val->constant || val->ident != NULL)
-		return 999;
 	int count = 0;
+	if (val->constant)
+		count++;
 	if (val->stack_pos > 0)
+		count++;
+	else if (val->ident != NULL)
 		count++;
 	int i;
 	for (i = 0; i < MAX_REG; ++i) {
@@ -183,6 +208,14 @@ void lex()
 			token = TOK_CHAR;
 		else if (strcmp(buf, "int") == 0)
 			token = TOK_INT;
+		else if (strcmp(buf, "short") == 0)
+			token = TOK_SHORT;
+		else if (strcmp(buf, "long") == 0)
+			token = TOK_LONG;
+		else if (strcmp(buf, "struct") == 0)
+			token = TOK_STRUCT;
+		else if (strcmp(buf, "typedef") == 0)
+			token = TOK_TYPEDEF;
 		else if (strcmp(buf, "void") == 0)
 			token = TOK_VOID;
 		else {
@@ -255,9 +288,9 @@ void push(int reg)
 {
 	struct value *val = registers[reg];
 	if (copies(val) == 1) {
-		printf("\tpush %s\n", reg_names[reg]);
 		stack_size += 8;
 		val->stack_pos = stack_size;
+		printf("\tpush %s\n", reg_names[reg]);
 	}
 	registers[reg] = NULL;
 }
@@ -278,6 +311,31 @@ size_t alloc_register()
 		}
 	}
 	error("unable to allocate a register\n");
+	return -1;
+}
+
+const char *asm_reg(const struct value *val, int reg)
+{
+	switch (val->type) {
+	case TYPE_POINTER:
+		return reg_names[reg];
+	case TYPE_INT:
+		switch (val->size) {
+		case 1:
+			return reg_byte_names[reg];
+		case 2:
+			return reg_word_names[reg];
+		case 4:
+			return reg_dword_names[reg];
+		case 8:
+			return reg_names[reg];
+		default:
+			assert(0);
+		}
+	default:
+		error("non-numeric type for expression\n");
+	}
+	return NULL;
 }
 
 /* Returns operand for printing. */
@@ -291,7 +349,7 @@ const char *asm_operand(const struct value *val)
 	/* First, see if we have it in a register */
 	int reg = search_reg(val);
 	if (reg >= 0)
-		return reg_names[reg];
+		return asm_reg(val, reg);
 
 	/* Second, try use a constant value */
 	if (val->constant) {
@@ -334,7 +392,7 @@ int load(struct value *val, int reg)
 		push(reg);
 	}
 
-	printf("\tmov %s, %s\n", asm_operand(val), reg_names[reg]);
+	printf("\tmov %s, %s\n", asm_operand(val), asm_reg(val, reg));
 	registers[reg] = val;
 	reg_locked[reg] = 1;
 	return reg;
@@ -343,24 +401,62 @@ int load(struct value *val, int reg)
 /* Parses a C declaration, which are used for variables and types */
 struct value *parse_declaration()
 {
-	int type;
-	switch (token) {
-	case TOK_VOID:
-		type = TYPE_VOID;
-		break;
-	case TOK_CHAR:
-		type = TYPE_CHAR;
-		break;
-	case TOK_INT:
-		type = TYPE_INT;
-		break;
-	default:
-		return NULL;
-	}
-	lex();
 	struct value *val = calloc(1, sizeof(*val));
 	assert(val != NULL);
-	val->type = type;
+	val->type = -1;
+
+	/* Read all available specifications that can be in random order */
+	int done = 0;
+	while (!done) {
+		switch (token) {
+		case TOK_VOID:
+			if (val->type >= 0)
+				error("already have a basic type\n");
+			val->type = TYPE_VOID;
+			break;
+		case TOK_CHAR:
+			if (val->type >= 0)
+				error("already have a basic type\n");
+			val->type = TYPE_INT;
+			val->size = 1;
+			break;
+		case TOK_INT:
+			if (val->size > 0)
+				error("type already has a size\n");
+			val->type = TYPE_INT;
+			break;
+		case TOK_SHORT:
+			if (val->size > 0)
+				error("type already has a size\n");
+			val->size = 2;
+			break;
+		case TOK_LONG:
+			if (val->size > 0)
+				error("type already has a size\n");
+			val->size = 8;
+			break;
+		default:
+			if (val->type < 0 && val->size == 0) {
+				/* Found nothing */
+				free(val);
+				return NULL;
+			}
+			done = 1;
+			break;
+		}
+		if (!done)
+			lex();
+	}
+	if (val->type < 0)
+		val->type = TYPE_INT;
+	if (val->size == 0)
+		val->size = 4;
+
+	if (check('*')) {
+		/* A pointer */
+		val->return_type = val->type;
+		val->type = TYPE_POINTER;
+	}
 
 	if (token == TOK_IDENTIFIER) {
 		val->ident = token_str;
@@ -407,9 +503,15 @@ void function_call(struct value *fun)
 	struct value *arg = fun->args;
 	int i = 0;
 	while (!check(')')) {
-		if (arg == NULL && !fun->varargs)
-			error("too many arguments for %s\n", fun->ident);
 		struct value *val = expr();
+		if (arg == NULL) {
+			if (!fun->varargs) {
+				error("too many arguments for %s\n",
+					fun->ident);
+			}
+		} else if (val->type != arg->type) {
+			error("type mismatch for argument\n");
+		}
 		values[i++] = val;
 		if (token != ')') {
 			expect(',');
@@ -461,13 +563,14 @@ struct value *term()
 			lex();
 			struct value *val = term();
 			int reg = load(val, -1);
-			printf("\tneg %s\n", reg_names[reg]);
+			printf("\tneg %s\n", asm_reg(val, reg));
 			reg_locked[reg] = 0;
 			drop(val);
 
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = val->type;
+			result->size = val->size;
 			registers[reg] = result;
 			break;
 		}
@@ -493,6 +596,7 @@ struct value *term()
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = TYPE_INT;
+			result->size = 4;
 			result->value = token_value;
 			result->constant = 1;
 			lex();
@@ -514,8 +618,11 @@ struct value *term()
 			result = calloc(1, sizeof(*result));
 			assert(result != NULL);
 			result->type = TYPE_POINTER;
+			result->return_type = TYPE_INT;
+			result->size = 1;
 			int reg = alloc_register();
-			printf("\tmov $l%d, %s\n", s->label, reg_names[reg]);
+			printf("\tmov $l%d, %s\n", s->label,
+				asm_reg(result, reg));
 			registers[reg] = result;
 			break;
 		}
@@ -532,8 +639,7 @@ struct value *binop_expr()
 	struct value *result = term();
 	while (1) {
 		int oper;
-		if (token == '+' || token == '-' || token == '*' ||
-		    token == '<' || token == '>') {
+		if (token == '+' || token == '-' || token == '*') {
 			oper = token;
 		} else
 			break;
@@ -545,23 +651,16 @@ struct value *binop_expr()
 		int reg = load(lhs, -1);
 		switch (oper) {
 		case '+':
-			printf("\tadd %s, %s\n", asm_operand(rhs), reg_names[reg]);
+			printf("\tadd %s, %s\n", asm_operand(rhs),
+				asm_reg(lhs, reg));
 			break;
 		case '-':
-			printf("\tsub %s, %s\n", asm_operand(rhs), reg_names[reg]);
+			printf("\tsub %s, %s\n", asm_operand(rhs),
+				asm_reg(lhs, reg));
 			break;
 		case '*':
-			printf("\timul %s, %s\n", asm_operand(rhs), reg_names[reg]);
-			break;
-		case '<':
-			printf("\tcmp %s, %s\n", asm_operand(rhs), reg_names[reg]);
-			printf("\tsetl %s\n", reg_byte_names[reg]);
-			printf("\tmovzx %s, %s\n", reg_byte_names[reg], reg_names[reg]);
-			break;
-		case '>':
-			printf("\tcmp %s, %s\n", asm_operand(rhs), reg_names[reg]);
-			printf("\tsetg %s\n", reg_byte_names[reg]);
-			printf("\tmovzx %s, %s\n", reg_byte_names[reg], reg_names[reg]);
+			printf("\timul %s, %s\n", asm_operand(rhs),
+				asm_reg(lhs, reg));
 			break;
 		default:
 			assert(0);
@@ -572,6 +671,50 @@ struct value *binop_expr()
 		result = calloc(1, sizeof(*result));
 		assert(result != NULL);
 		result->type = lhs->type;
+		result->size = lhs->size;
+		registers[reg] = result;
+	}
+	return result;
+}
+
+/* Handles relational binary operations */
+struct value *relational_expr()
+{
+	struct value *result = binop_expr();
+	while (1) {
+		int oper;
+		if (token == '<' || token == '>') {
+			oper = token;
+		} else
+			break;
+		lex();
+
+		struct value *lhs = result;
+		struct value *rhs = binop_expr();
+
+		int reg = load(lhs, -1);
+		printf("\tcmp %s, %s\n", asm_operand(rhs), asm_reg(lhs, reg));
+
+		switch (oper) {
+		case '<':
+			printf("\tsetl %s\n", reg_byte_names[reg]);
+			break;
+		case '>':
+			printf("\tsetg %s\n", reg_byte_names[reg]);
+			break;
+		default:
+			assert(0);
+		}
+
+		reg_locked[reg] = 0;
+		drop(lhs);
+		drop(rhs);
+		result = calloc(1, sizeof(*result));
+		assert(result != NULL);
+		result->type = TYPE_INT;
+		result->size = 4;
+		printf("\tmovzx %s, %s\n", reg_byte_names[reg],
+			asm_reg(result, reg));
 		registers[reg] = result;
 	}
 	return result;
@@ -580,7 +723,7 @@ struct value *binop_expr()
 /* Process an expression. Assigment always has the highest precedence. */
 struct value *expr()
 {
-	struct value *result = binop_expr();
+	struct value *result = relational_expr();
 	if (token == '=') {
 		lex();
 
@@ -589,7 +732,8 @@ struct value *expr()
 		struct value *val = expr();
 
 		int reg = load(val, -1);
-		printf("\tmov %s, %s\n", reg_names[reg], asm_operand(target));
+		printf("\tmov %s, %s\n", asm_reg(val, reg),
+			asm_operand(target));
 		reg_locked[reg] = 0;
 
 		/* The value is passed through */
@@ -624,19 +768,20 @@ void if_statement()
 {
 	expect('(');
 
+	/* The condition block must leave the state exactly the same */
 	size_t old_stack = stack_size;
-
 	struct value *condition = expr();
 	expect(')');
 
-	/* Compare the condition against zero */
-	int skip_label = next_label++;
 	int reg = load(condition, -1);
-	printf("\tor %s, %s\n", reg_names[reg], reg_names[reg]);
-	printf("\tjz l%d\n", skip_label);
 	drop(condition);
-
 	end_block(old_stack);
+
+	/* Compare the condition against zero (still in register) */
+	int skip_label = next_label++;
+	printf("\tor %s, %s\n", asm_reg(condition, reg),
+		asm_reg(condition, reg));
+	printf("\tjz l%d\n", skip_label);
 
 	block();
 
@@ -650,19 +795,20 @@ void while_statement()
 	int test_label = next_label++;
 	printf("l%d:\n", test_label);
 
+	/* The condition block must leave the state exactly the same */
 	size_t old_stack = stack_size;
-
 	struct value *condition = expr();
 	expect(')');
 
+	int reg = load(condition, -1);
+	drop(condition);
+	end_block(old_stack);
+
 	/* Compare the condition against zero */
 	int end_label = next_label++;
-	int reg = load(condition, -1);
-	printf("\tor %s, %s\n", reg_names[reg], reg_names[reg]);
+	printf("\tor %s, %s\n", asm_reg(condition, reg),
+		asm_reg(condition, reg));
 	printf("\tjz l%d\n", end_label);
-	drop(condition);
-
-	end_block(old_stack);
 
 	block();
 
@@ -675,48 +821,41 @@ void for_statement()
 {
 	expect('(');
 
-	size_t old_stack = stack_size;
-
 	struct value *initial = expr();
-	drop(initial);
 	expect(';');
-
-	end_block(old_stack);
+	drop(initial);
 
 	int test_label = next_label++;
 	printf("l%d:\n", test_label);
 
-	old_stack = stack_size;
-
+	/* The condition block must leave the state exactly the same */
+	size_t old_stack = stack_size;
 	struct value *condition = expr();
 	expect(';');
 
 	/* Compare the condition against zero */
-	int end_label = next_label++;
 	int reg = load(condition, -1);
-	printf("\tor %s, %s\n", reg_names[reg], reg_names[reg]);
-	printf("\tjz l%d\n", end_label);
 	drop(condition);
-
-	/* Skip over the step which follows */
-	int begin_label = next_label++;
-	printf("\tjmp l%d\n", begin_label);
-
 	end_block(old_stack);
+
+	int end_label = next_label++;
+	int begin_label = next_label++;
+	printf("\tor %s, %s\n", asm_reg(condition, reg),
+		asm_reg(condition, reg));
+	printf("\tjz l%d\n", end_label);
+	printf("\tjmp l%d\n", begin_label);
 
 	int step_label = next_label++;
 	printf("l%d:\n", step_label);
 
 	old_stack = stack_size;
-
 	struct value *step = expr();
-	drop(step);
 	expect(')');
+	drop(step);
+	end_block(old_stack);
 
 	/* Jump back to test the condition */
 	printf("\tjmp l%d\n", test_label);
-
-	end_block(old_stack);
 
 	printf("l%d:\n", begin_label);
 
@@ -739,6 +878,7 @@ void return_statement()
 		printf("\tadd $%zu, %%rsp\n", stack_size - 8);
 	printf("\tpop %%rbx\n");
 	printf("\tret\n");
+	drop(val);
 }
 
 void statement()
@@ -764,18 +904,18 @@ void statement()
 			struct value *var = parse_declaration();
 			if (var != NULL) {
 				/* It's a variable declaration */
-				stack_size += 8;
+				stack_size += size_of(var);
 				var->stack_pos = stack_size;
 				var->next = symtab;
 				symtab = var;
-				printf("\tsub $8, %%rsp\n");
+				printf("\tsub $%zu, %%rsp\n", size_of(var));
 
 				if (check('=')) {
 					/* Initialization */
 					struct value *init = expr();
 					int reg = load(init, -1);
 					printf("\tmov %s, %zu(%%rsp)\n",
-						reg_names[reg],
+						asm_reg(init, reg),
 						stack_size - var->stack_pos);
 					drop(init);
 				}

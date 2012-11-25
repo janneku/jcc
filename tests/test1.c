@@ -1,4 +1,4 @@
-void printf(..);
+void printf(char *fmt, ..);
 
 int main() {
 	int cols = 8;
