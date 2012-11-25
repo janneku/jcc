@@ -15,6 +15,7 @@ enum {
 	/* 0..255 are single character tokens */
 	TOK_WHILE = 1000,
 	TOK_IF,
+	TOK_ELSE,
 	TOK_FOR,
 	TOK_RETURN,
 	TOK_CHAR,
@@ -200,6 +201,8 @@ void lex()
 			token = TOK_WHILE;
 		else if (strcmp(buf, "if") == 0)
 			token = TOK_IF;
+		else if (strcmp(buf, "else") == 0)
+			token = TOK_ELSE;
 		else if (strcmp(buf, "for") == 0)
 			token = TOK_FOR;
 		else if (strcmp(buf, "return") == 0)
@@ -539,8 +542,10 @@ void function_call(struct value *fun)
 
 	printf("\tcall %s\n", fun->ident);
 	for (i = 0; i < MAX_REG; ++i) {
-		if (values[i] != NULL)
+		if (values[i] != NULL) {
+			reg_locked[i] = 0;
 			drop(values[i]);
+		}
 	}
 }
 
@@ -816,7 +821,18 @@ void if_statement()
 
 	block();
 
-	printf("l%d:\n", skip_label);
+	if (check(TOK_ELSE)) {
+		/* Skip over the else block */
+		int end_label = next_label++;
+		printf("\tjmp l%d\n", end_label);
+		printf("l%d:\n", skip_label);
+
+		block();
+
+		printf("l%d:\n", end_label);
+	} else {
+		printf("l%d:\n", skip_label);
+	}
 }
 
 void while_statement()
@@ -884,8 +900,6 @@ void for_statement()
 	expect(')');
 	drop(step);
 	end_block(old_stack);
-
-	/* Jump back to test the condition */
 	printf("\tjmp l%d\n", test_label);
 
 	printf("l%d:\n", begin_label);
